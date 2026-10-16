@@ -1,0 +1,301 @@
+package main
+
+import db.sqlite
+import net.http
+import net.router
+import net.http.swagger
+import encoding.json
+import encoding.encerr
+import env
+
+const TASK_SCHEMA := `{"type":"object","required":["id","title","completed"],"properties":{"id":{"type":"integer","minimum":1,"example":1},"title":{"type":"string","example":"یادگیری سلام"},"completed":{"type":"boolean","example":false}}}`
+const INPUT_SCHEMA := `{"type":"object","required":["title"],"properties":{"title":{"type":"string","minLength":1,"description":"Trimmed before saving; must contain 1 to 500 UTF-8 bytes.","example":"یادگیری سلام"},"completed":{"type":"boolean","default":false,"example":false}}}`
+const ERROR_SCHEMA := `{"type":"object","required":["error"],"properties":{"error":{"type":"string","example":"task not found"}}}`
+mut apiSpec := ""
+
+struct TaskInput:
+    pub title: str = ""
+    pub completed: bool = false
+end
+
+func send(ctx: i64, status: int, body: str):
+    http.Ctx_status(ctx, status)
+    http.Ctx_json(ctx, body)
+end
+
+func fail(ctx: i64, status: int, message: str):
+    send(ctx, status, "{" + json.Member("error", message) + "}")
+end
+
+func connect(): sqlite.Database:
+    ret sqlite.Open(env.GetOr("DB_PATH", "tasks.db"))
+end
+
+func taskJson(rows: sqlite.Rows): str:
+    ret "{" + json.MemberInt("id", sqlite.Int64(rows, 0)) + "," + json.Member("title", sqlite.Text(rows, 1)) + "," + json.MemberBool("completed", sqlite.Int(rows, 2) == 1) + "}"
+end
+
+func validId(ctx: i64): int:
+    raw := http.Ctx_param(ctx, "id")
+    id := raw.to_int()
+    if id <= 0 or raw != "" + id:
+        fail(ctx, 400, "id must be a positive integer")
+        ret 0
+    end
+    ret id
+end
+
+func readTask(d: sqlite.Database, id: int): str:
+    rows := sqlite.Prepare(d, "SELECT id, title, completed FROM tasks WHERE id = ?")
+    if not sqlite.StmtOk(rows): ret "" end
+    defer sqlite.Finish(rows)
+    if sqlite.BindInt(rows, 1, id as i64) != 0: ret "" end
+    if sqlite.Next(rows): ret taskJson(rows) end
+    ret ""
+end
+
+func health(ctx: i64):
+    d := connect()
+    defer sqlite.Close(d)
+    if not sqlite.Ok(d):
+        fail(ctx, 503, "database unavailable")
+        ret
+    end
+    if sqlite.QueryInt(d, "SELECT 1") != 1:
+        fail(ctx, 503, "database unavailable")
+        ret
+    end
+    send(ctx, 200, `{"status":"ok"}`)
+end
+
+func listTasks(ctx: i64):
+    d := connect()
+    defer sqlite.Close(d)
+    rows := sqlite.Query(d, "SELECT id, title, completed FROM tasks ORDER BY id")
+    if not sqlite.StmtOk(rows):
+        fail(ctx, 500, "database query failed")
+        ret
+    end
+    mut body := "["
+    mut first := true
+    until sqlite.Next(rows):
+        if not first: body += "," end
+        body += taskJson(rows)
+        first = false
+    end
+    if sqlite.Finish(rows) != 0:
+        fail(ctx, 500, "database query failed")
+        ret
+    end
+    send(ctx, 200, body + "]")
+end
+
+func getTask(ctx: i64):
+    id := validId(ctx)
+    if id == 0: ret end
+    d := connect()
+    defer sqlite.Close(d)
+    body := readTask(d, id)
+    if body == "":
+        fail(ctx, 404, "task not found")
+        ret
+    end
+    send(ctx, 200, body)
+end
+
+func saveTask(ctx: i64):
+    updating := http.Ctx_method(ctx) == "PUT"
+    mut id := 0
+    if updating:
+        id = validId(ctx)
+        if id == 0: ret end
+    end
+    mut data := TaskInput {}
+    mut err := encerr.NoError()
+    if not json.Unmarshal(http.Ctx_body(ctx), data, err):
+        fail(ctx, 400, "expected JSON with string title and boolean completed")
+        ret
+    end
+    title := data.title.trim()
+    if title.len() == 0 or title.len() > 500:
+        fail(ctx, 400, "title must contain 1 to 500 bytes")
+        ret
+    end
+    d := connect()
+    defer sqlite.Close(d)
+    mut sql := "INSERT INTO tasks(title, completed) VALUES (?, ?)"
+    if updating: sql = "UPDATE tasks SET title = ?, completed = ? WHERE id = ?" end
+    stmt := sqlite.Prepare(d, sql)
+    if not sqlite.StmtOk(stmt):
+        fail(ctx, 500, "database write failed")
+        ret
+    end
+    mut bound := sqlite.BindText(stmt, 1, title)
+    mut completed := 0 as i64
+    if data.completed: completed = 1 end
+    bound += sqlite.BindInt(stmt, 2, completed)
+    if updating: bound += sqlite.BindInt(stmt, 3, id as i64) end
+    if bound != 0:
+        sqlite.Finish(stmt)
+        fail(ctx, 500, "database binding failed")
+        ret
+    end
+    sqlite.Next(stmt)
+    if sqlite.Finish(stmt) != 0:
+        fail(ctx, 500, "database write failed")
+        ret
+    end
+    if updating:
+        if sqlite.Changes(d) == 0:
+            fail(ctx, 404, "task not found")
+            ret
+        end
+        send(ctx, 200, readTask(d, id))
+    else:
+        id = sqlite.LastInsertId(d) as int
+        http.Ctx_set_header(ctx, "Location", "/tasks/" + id)
+        send(ctx, 201, readTask(d, id))
+    end
+end
+
+func deleteTask(ctx: i64):
+    id := validId(ctx)
+    if id == 0: ret end
+    d := connect()
+    defer sqlite.Close(d)
+    stmt := sqlite.Prepare(d, "DELETE FROM tasks WHERE id = ?")
+    if not sqlite.StmtOk(stmt):
+        fail(ctx, 500, "database write failed")
+        ret
+    end
+    if sqlite.BindInt(stmt, 1, id as i64) != 0:
+        sqlite.Finish(stmt)
+        fail(ctx, 500, "database binding failed")
+        ret
+    end
+    sqlite.Next(stmt)
+    if sqlite.Finish(stmt) != 0:
+        fail(ctx, 500, "database write failed")
+        ret
+    end
+    if sqlite.Changes(d) == 0:
+        fail(ctx, 404, "task not found")
+        ret
+    end
+    http.Ctx_status(ctx, 204)
+    http.Ctx_text(ctx, "")
+end
+
+func docsOperation(doc &: swagger.Doc, method: str, path: str, summary: str, operationId: str):
+    swagger.Route(doc, method, path)
+    if path == "/health":
+        swagger.Tag(doc, "Health")
+    else:
+        swagger.Tag(doc, "Tasks")
+    end
+    swagger.Summary(doc, summary)
+    swagger.OperationId(doc, operationId)
+end
+
+func docsError(doc &: swagger.Doc, code: int, description: str):
+    swagger.ReturnsRaw(doc, code, description, swagger.JSON_TYPE, ERROR_SCHEMA)
+end
+
+func document(routes: router.Router): swagger.Doc:
+    mut doc := swagger.New("Salam Tasks API", "1.0.0")
+    swagger.Describe(doc, "API مدیریت کارها با زبان سلام و SQLite. عنوان الزامی و وضعیت پیش‌فرض false است. عنوان پس از حذف فاصله ابتدا و انتها باید ۱ تا ۵۰۰ بایت UTF-8 باشد. حداکثر بدنه درخواست ۸ کیلوبایت است. این API محلی احراز هویت ندارد.")
+    swagger.Scan(doc, routes)
+
+    docsOperation(doc, "GET", "/health", "بررسی سلامت سرویس", "getHealth")
+    swagger.ReturnsRaw(doc, 200, "Database is reachable", swagger.JSON_TYPE, `{"type":"object","required":["status"],"properties":{"status":{"type":"string","enum":["ok"]}}}`)
+    docsError(doc, 503, "Database unavailable")
+
+    docsOperation(doc, "GET", "/tasks", "فهرست کارها", "listTasks")
+    swagger.Details(doc, "تمام کارها به ترتیب صعودی شناسه؛ فهرست خالی به صورت [] برمی‌گردد.")
+    swagger.ReturnsRaw(doc, 200, "All tasks", swagger.JSON_TYPE, `{"type":"array","items":` + TASK_SCHEMA + "}")
+    docsError(doc, 500, "Database query failed")
+
+    docsOperation(doc, "POST", "/tasks", "ایجاد کار جدید", "createTask")
+    swagger.AcceptsRaw(doc, "عنوان الزامی؛ completed اختیاری و پیش‌فرض false است.", swagger.JSON_TYPE, INPUT_SCHEMA, true)
+    swagger.ReturnsRaw(doc, 201, "Task created", swagger.JSON_TYPE, TASK_SCHEMA)
+    swagger.ReturnsHeader(doc, 201, "Location", "Relative URL of the created task")
+    docsError(doc, 400, "Invalid JSON, field type or title")
+    docsError(doc, 500, "Database write failed")
+
+    docsOperation(doc, "GET", "/tasks/:id", "دریافت یک کار", "getTask")
+    swagger.PathParam(doc, "id", "شناسه عددی مثبت بدون صفر ابتدایی؛ مثال: 1")
+    swagger.ReturnsRaw(doc, 200, "Task found", swagger.JSON_TYPE, TASK_SCHEMA)
+    docsError(doc, 400, "Invalid task id")
+    docsError(doc, 404, "Task not found")
+
+    docsOperation(doc, "PUT", "/tasks/:id", "ویرایش کار", "updateTask")
+    swagger.PathParam(doc, "id", "شناسه عددی مثبت بدون صفر ابتدایی؛ مثال: 1")
+    swagger.Details(doc, "عنوان و وضعیت جایگزین می‌شوند. اگر completed ارسال نشود، وضعیت به false تغییر می‌کند.")
+    swagger.AcceptsRaw(doc, "مقادیر جدید کار", swagger.JSON_TYPE, INPUT_SCHEMA, true)
+    swagger.ReturnsRaw(doc, 200, "Task updated", swagger.JSON_TYPE, TASK_SCHEMA)
+    docsError(doc, 400, "Invalid id, JSON, field type or title")
+    docsError(doc, 404, "Task not found")
+    docsError(doc, 500, "Database write failed")
+
+    docsOperation(doc, "DELETE", "/tasks/:id", "حذف کار", "deleteTask")
+    swagger.PathParam(doc, "id", "شناسه عددی مثبت بدون صفر ابتدایی؛ مثال: 1")
+    swagger.ReturnsNothing(doc, 204, "Task deleted; empty response body")
+    docsError(doc, 400, "Invalid task id")
+    docsError(doc, 404, "Task not found")
+    docsError(doc, 500, "Database write failed")
+    ret doc
+end
+
+func openapi(ctx: i64):
+    send(ctx, 200, apiSpec)
+end
+
+func docs(ctx: i64):
+    http.Ctx_html(ctx, `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Salam Tasks API · Swagger UI</title>
+<link rel="stylesheet" href="/docs/assets/swagger-ui.css">
+<style>body{margin:0;background:#fafafa}.swagger-ui .info .description{line-height:1.9}.swagger-ui .info .description p{unicode-bidi:plaintext}</style>
+</head><body>
+<div id="swagger-ui"></div>
+<script src="/docs/assets/swagger-ui-bundle.js"></script>
+<script>window.onload=function(){window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui',deepLinking:true,displayRequestDuration:true,tryItOutEnabled:true,validatorUrl:null,presets:[SwaggerUIBundle.presets.apis]});};</script>
+</body></html>`)
+end
+
+func main:
+    d := connect()
+    if not sqlite.Ok(d):
+        println "Cannot open database"
+        ret 1
+    end
+    if sqlite.Exec(d, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL CHECK(length(title) > 0), completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)))") != 0:
+        println sqlite.Error(d)
+        sqlite.Close(d)
+        ret 1
+    end
+    sqlite.Close(d)
+    mut routes := router.NewRouter()
+    router.Get(routes, "/health", health)
+    router.Get(routes, "/tasks", listTasks)
+    router.Get(routes, "/tasks/:id", getTask)
+    router.Post(routes, "/tasks", saveTask)
+    router.Put(routes, "/tasks/:id", saveTask)
+    router.Delete(routes, "/tasks/:id", deleteTask)
+    mut doc := document(routes)
+    apiSpec = swagger.Spec(doc)
+    swagger.Free(doc)
+    router.Get(routes, "/openapi.json", openapi)
+    router.Get(routes, "/docs", docs)
+    router.Get(routes, "/docs/", docs)
+    router.Static(routes, "/docs/assets", env.GetOr("DOCS_ASSETS", "docs/assets"))
+    port := env.GetInt("PORT", 8080) as int
+    mut server := http.NewServer(port)
+    http.SetHost(server, "127.0.0.1")
+    http.SetMaxBodyBytes(8192)
+    http.Use(server, routes)
+    println "API listening on http://127.0.0.1:" + port
+    http.Run(server)
+    ret 0
+end
